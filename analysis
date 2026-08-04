@@ -1,0 +1,515 @@
+"""
+EMG Automatic Analysis Core Pipeline: main_analysis.py (Global Alignment Version)
+Features:
+1. Auto-scans 4-level directories: EMG_Data/Subject/Date/Muscle/
+2. Strict Cross-Pairing: DIY Internal (I) <-> BTS Outer (O)
+3. Full-length Cross-Correlation: Automatically searches full range to maximize waveform overlap.
+4. Generates 100% English figures and CSV summaries to avoid font missing issues.
+5. Flexible BTS Filename Matcher: Compatible with instrument-generated prefixes, spaces, and pure MVC.
+"""
+
+from __future__ import annotations
+import csv
+import re
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# ⚙️ Directory & Target Configurations
+# ============================================================
+BASE_DIR = Path(__file__).resolve().parent
+EMG_DATA_ROOT = BASE_DIR / "EMG_Data"         # Input data root directory
+OUTPUT_ROOT = BASE_DIR / "analysis_output"    # Output report directory
+
+TARGET_SUBJECT = None  # e.g., "S01"
+TARGET_DATE = None     # e.g., "0714"
+
+
+# ============================================================
+# 📊 Signal Processing Parameters
+# ============================================================
+BASELINE_SEC = 5.0          # First 5 seconds for baseline offset correction
+RMS_WINDOW_MS = 100         # 100 ms moving RMS window
+THRESHOLD_K = 3.0           # Onset threshold = baseline_mean + K * baseline_std
+MIN_ACTIVE_SEC = 0.8        # Minimum active contraction duration (seconds)
+PLOT_DPI = 140              # Output image DPI resolution
+
+plt.rcParams['axes.unicode_minus'] = False
+
+
+# ============================================================
+# 📁 Directory Discovery & Exact Matching Engine
+# ============================================================
+def auto_discover_and_pair_files() -> List[Dict]:
+    """
+    Clean Standardized Matching Engine
+    Cross-Pairing Protocol: DIY Internal (I) <-> BTS Outer (O)
+    Updated: Fully supports instrument prefixes, spaces, and pure 'mvc1' / '30mvc1' formats.
+    """
+    paired_list = []
+    if not EMG_DATA_ROOT.exists():
+        print(f"[Warning] EMG_Data root not found at: {EMG_DATA_ROOT}")
+        return paired_list
+
+    diy_dirs = [p for p in EMG_DATA_ROOT.rglob("DIY") if p.is_dir()]
+
+    for diy_dir in diy_dirs:
+        parts = diy_dir.relative_to(EMG_DATA_ROOT).parts
+        if len(parts) < 3:
+            continue
+        
+        sub_id, date_str, muscle_str = parts[0], parts[1], parts[2]
+
+        if TARGET_SUBJECT and sub_id != TARGET_SUBJECT:
+            continue
+        if TARGET_DATE and date_str != TARGET_DATE:
+            continue
+
+        bts_dir = diy_dir.parent / "BTS"
+
+        for diy_file in diy_dir.glob("*.csv"):
+            if "processed_timeseries" in diy_file.name or "analysis_summary" in diy_file.name:
+                continue
+
+            file_name = diy_file.stem
+            match = re.match(r"^([O|I|o|i])_([A-Za-z0-9%]+)_T([1-3])", file_name)
+            
+            if match:
+                diy_pos = match.group(1).upper()   # "O" or "I"
+                cond = match.group(2).lower()      # "mvc", "30", "60", "100"
+                trial = match.group(3)             # "1", "2", "3"
+            else:
+                continue
+
+            # 🎯 Cross-pairing logic
+            target_bts_pos = "O" if diy_pos == "I" else "I"
+
+            # 🎯 處理純 mvc 與 %mvc 的檔名結構
+            if cond == "mvc":
+                cond_str = f"mvc{trial}"
+            else:
+                cond_str = f"{cond}mvc{trial}"
+
+            # 建立搜尋關鍵字模式 (支援底線或空格相容: e.g., "o mvc1.emt" or "mvc1_o.emt")
+            pattern_space = f"{target_bts_pos.lower()} {cond_str}.emt"
+            pattern_underscore = f"{cond_str}_{target_bts_pos.lower()}.emt"
+
+            bts_file = None
+            if bts_dir.exists():
+                all_bts_files = list(bts_dir.glob("*.emt"))
+                for f in all_bts_files:
+                    fname = f.name.lower()
+                    if pattern_space in fname or pattern_underscore in fname:
+                        bts_file = f
+                        break
+
+            if not bts_file:
+                print(f"[Skip] DIY: {diy_file.name} -> Missing BTS file matching pattern: '{pattern_space}'")
+                continue
+
+            paired_list.append({
+                "name": f"{sub_id}_{date_str}_{muscle_str}_DIY-{diy_pos}_BTS-{target_bts_pos}_{cond.upper()}_T{trial}",
+                "bts_emt": bts_file,
+                "diy_csv": diy_file,
+                "placement": f"Subject:{sub_id} | Muscle:{muscle_str} | DIY:{diy_pos} vs BTS:{target_bts_pos}",
+                "sub_id": sub_id,
+                "date": date_str,
+                "muscle": muscle_str,
+                "condition": cond.upper(),
+                "trial": f"T{trial}",
+                "diy_position": diy_pos,
+                "bts_position": target_bts_pos
+            })
+            
+    print(f"[Info] Scanning completed. Found {len(paired_list)} exact matched pairs.\n")
+    return paired_list
+
+
+# ============================================================
+# 📐 Math & DSP Utilities
+# ============================================================
+def ensure_1d_float(x) -> np.ndarray:
+    arr = np.asarray(x, dtype=float).reshape(-1)
+    return arr[np.isfinite(arr)]
+
+
+def estimate_fs(time: np.ndarray, default: float = 1000.0) -> float:
+    time = ensure_1d_float(time)
+    if len(time) < 2: return default
+    dt = np.diff(time)
+    dt = dt[(dt > 0) & np.isfinite(dt)]
+    return float(1.0 / np.median(dt)) if len(dt) > 0 else default
+
+
+def minmax_normalize(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    xmin, xmax = np.nanmin(x), np.nanmax(x)
+    if not np.isfinite(xmin) or not np.isfinite(xmax) or np.isclose(xmax, xmin):
+        return np.zeros_like(x)
+    return (x - xmin) / (xmax - xmin)
+
+
+def zscore(x: np.ndarray) -> np.ndarray:
+    return (x - np.nanmean(x)) / (np.nanstd(x) + 1e-12)
+
+
+def pearson_corr(x: np.ndarray, y: np.ndarray) -> float:
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+    if len(x) < 3 or np.std(x) < 1e-12 or np.std(y) < 1e-12: return float("nan")
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def spearman_corr(x: np.ndarray, y: np.ndarray) -> float:
+    rx = pd.Series(x).rank(method="average").to_numpy(dtype=float)
+    ry = pd.Series(y).rank(method="average").to_numpy(dtype=float)
+    return pearson_corr(rx, ry)
+
+
+def rmse(x: np.ndarray, y: np.ndarray) -> float:
+    mask = np.isfinite(x) & np.isfinite(y)
+    return float(np.sqrt(np.mean((x[mask] - y[mask]) ** 2))) if np.sum(mask) > 0 else float("nan")
+
+
+def moving_average(x: np.ndarray, window_samples: int) -> np.ndarray:
+    window_samples = max(1, int(window_samples))
+    return np.convolve(x, np.ones(window_samples) / window_samples, mode="same")
+
+
+def rms_envelope(x: np.ndarray, fs: float, window_ms: float) -> np.ndarray:
+    win = max(1, int(round(fs * window_ms / 1000.0)))
+    return np.sqrt(np.convolve(x ** 2, np.ones(win) / win, mode="same"))
+
+
+def high_low_agreement(bts_norm: np.ndarray, diy_norm: np.ndarray, low_q: float = 0.33, high_q: float = 0.67) -> float:
+    bts_low, bts_high = bts_norm <= low_q, bts_norm >= high_q
+    use = bts_low | bts_high
+    if np.sum(use) == 0: return float("nan")
+    agree = (bts_low & (diy_norm <= low_q)) | (bts_high & (diy_norm >= high_q))
+    return float(np.mean(agree[use]))
+
+
+def dtw_distance(x: np.ndarray, y: np.ndarray, max_points: int = 800) -> float:
+    n = min(len(x), len(y))
+    if n == 0: return float("nan")
+    if n > max_points:
+        idx = np.linspace(0, n - 1, max_points).astype(int)
+        x, y = x[idx], y[idx]
+    n, m = len(x), len(y)
+    dp = np.full((n + 1, m + 1), np.inf)
+    dp[0, 0] = 0.0
+    for i in range(1, n + 1):
+        xi = x[i - 1]
+        for j in range(1, m + 1):
+            dp[i, j] = abs(xi - y[j - 1]) + min(dp[i - 1, j], dp[i, j - 1], dp[i - 1, j - 1])
+    return float(dp[n, m] / (n + m))
+
+
+# ============================================================
+# 📥 File Readers
+# ============================================================
+def read_bts_emt(path: Path) -> Dict:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+    fs = None
+    for line in lines:
+        if "Frequency" in line:
+            m = re.search(r"([0-9]+(?:\.[0-9]+)?)", line)
+            if m: fs = float(m.group(1))
+            break
+    header_idx = next((i for i, line in enumerate(lines) if "Frame" in line and "Time" in line), None)
+    if header_idx is None: raise ValueError(f"Header missing in {path.name}")
+    
+    time_list, value_list = [], []
+    for line in lines[header_idx + 1:]:
+        parts = line.strip().split()
+        if len(parts) < 3: continue
+        try:
+            time_list.append(float(parts[1]))
+            value_list.append(float(parts[-1]))
+        except ValueError: continue
+    time, signal = ensure_1d_float(time_list), ensure_1d_float(value_list)
+    n = min(len(time), len(signal))
+    time, signal = time[:n], signal[:n]
+    if fs is None: fs = estimate_fs(time, 1000.0)
+    return {"time": time - time[0] if len(time) else time, "signal": signal, "fs": fs, "unit": "mV"}
+
+
+def read_diy_csv(path: Path) -> Dict:
+    with open(path, "r", encoding="utf-8-sig", errors="ignore") as f:
+        rows = list(csv.reader(f))
+    metadata = {}
+    header_idx = None
+    for i, row in enumerate(rows):
+        if not row: continue
+        if row[0].strip() == "sample_index":
+            header_idx = i
+            break
+        if len(row) >= 2: metadata[row[0].strip()] = row[1].strip()
+    if header_idx is None: raise ValueError(f"Header 'sample_index' missing in {path.name}")
+    
+    df = pd.read_csv(path, encoding="utf-8-sig", skiprows=header_idx)
+    df.columns = [c.strip() for c in df.columns]
+    time = df["time_sec"].to_numpy(dtype=float) if "time_sec" in df.columns else np.arange(len(df)) / 1000.0
+    
+    if "emg_centered" in df.columns:
+        signal, unit = df["emg_centered"].to_numpy(dtype=float), "centered ADC"
+    elif "adc_raw" in df.columns:
+        raw = df["adc_raw"].to_numpy(dtype=float)
+        signal, unit = raw - np.nanmean(raw[:min(len(raw), 1000)]), "ADC centered"
+    else: raise ValueError(f"Required signal column missing in {path.name}")
+    
+    fs = float(metadata.get("sample_rate", estimate_fs(time, 1000.0)))
+    return {"time": time - time[0] if len(time) else time, "signal": signal, "fs": fs, "unit": unit}
+
+
+# ============================================================
+# 🔄 Global Alignment Engine
+# ============================================================
+def make_common_timebase(bts: Dict, diy: Dict) -> Tuple[np.ndarray, float]:
+    fs = round(min(bts["fs"], diy["fs"]))
+    start, end = max(bts["time"][0], diy["time"][0]), min(bts["time"][-1], diy["time"][-1])
+    if end <= start: raise ValueError("Time range overlap is empty.")
+    return np.arange(start, end, 1.0 / fs), fs
+
+
+def preprocess_emg(raw: np.ndarray, t: np.ndarray, fs: float) -> Dict:
+    baseline_mask = t <= BASELINE_SEC
+    baseline = float(np.nanmean(raw[baseline_mask])) if np.sum(baseline_mask) > max(10, int(fs*0.5)) else 0.0
+    centered = raw - baseline
+    rectified = np.abs(centered)
+    return {"baseline": baseline, "centered": centered, "rectified": rectified, "rms": rms_envelope(rectified, fs, RMS_WINDOW_MS)}
+
+
+def find_global_best_lag(x: np.ndarray, y: np.ndarray, fs: float) -> Tuple[int, float, float]:
+    """
+    Searches the entire signal length to find the lag that MAXIMIZES Pearson Correlation.
+    """
+    x, y = zscore(x), zscore(y)
+    n = min(len(x), len(y))
+    x, y = x[:n], y[:n]
+    
+    max_lag = int(0.8 * n)
+    best_r = -np.inf
+    best_lag = 0
+
+    step = max(1, int(fs * 0.05)) # 50ms step
+    for lag in range(-max_lag, max_lag + 1, step):
+        if lag < 0:
+            xs = x[-lag:]
+            ys = y[:len(xs)]
+        elif lag > 0:
+            xs = x[:len(x) - lag]
+            ys = y[lag:]
+        else:
+            xs, ys = x, y
+
+        if len(xs) < int(fs * 1.5): continue
+        r = pearson_corr(xs, ys)
+        if np.isfinite(r) and r > best_r:
+            best_r = r
+            best_lag = lag
+
+    fine_range = int(round(fs * 0.5))
+    for lag in range(best_lag - fine_range, best_lag + fine_range + 1):
+        if lag < -max_lag or lag > max_lag: continue
+        if lag < 0:
+            xs = x[-lag:]
+            ys = y[:len(xs)]
+        elif lag > 0:
+            xs = x[:len(x) - lag]
+            ys = y[lag:]
+        else:
+            xs, ys = x, y
+
+        if len(xs) < int(fs * 1.5): continue
+        r = pearson_corr(xs, ys)
+        if np.isfinite(r) and r > best_r:
+            best_r = r
+            best_lag = lag
+
+    return best_lag, best_lag / fs, float(best_r)
+
+
+def align_by_lag(t: np.ndarray, bts: np.ndarray, diy: np.ndarray, lag_samples: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n = min(len(bts), len(diy), len(t))
+    t, bts, diy = t[:n], bts[:n], diy[:n]
+    if lag_samples < 0:
+        k = -lag_samples
+        return t[k:] - t[k], bts[k:], diy[:len(bts[k:])]
+    elif lag_samples > 0:
+        k = lag_samples
+        return t[:n-k] - t[:n-k][0], bts[:n-k], diy[k:]
+    return t, bts, diy
+
+
+def detect_active_segment(t: np.ndarray, norm_rms: np.ndarray, fs: float) -> Dict:
+    baseline_mask = t <= BASELINE_SEC
+    base = norm_rms[baseline_mask] if np.sum(baseline_mask) > max(10, int(fs*0.5)) else norm_rms[:int(fs*2)]
+    threshold = float(np.clip(np.nanmean(base) + THRESHOLD_K * np.nanstd(base), 0.10, 0.60))
+    active = norm_rms > threshold
+    min_len = int(round(MIN_ACTIVE_SEC * fs))
+    
+    segments, i, n = [], 0, len(active)
+    while i < n:
+        if not active[i]: i += 1; continue
+        s = i
+        while i < n and active[i]: i += 1
+        if (i - s) >= min_len: segments.append((s, i))
+    
+    peak_idx = int(np.nanargmax(norm_rms))
+    if segments:
+        chosen = next((se for se in segments if se[0] <= peak_idx < se[1]), max(segments, key=lambda se: se[1]-se[0]))
+        onset_idx, offset_idx = chosen
+    else:
+        half = int(round(3.0 * fs))
+        onset_idx, offset_idx = max(0, peak_idx - half), min(len(norm_rms)-1, peak_idx + half)
+        
+    local_peak = onset_idx + int(np.nanargmax(norm_rms[onset_idx:offset_idx]))
+    return {
+        "threshold": threshold, "onset_idx": onset_idx, "offset_idx": offset_idx, "peak_idx": local_peak,
+        "onset_sec": float(t[onset_idx]), "offset_sec": float(t[offset_idx]), "peak_sec": float(t[local_peak]), "peak_value": float(norm_rms[local_peak])
+    }
+
+
+# ============================================================
+# 🧬 Analysis & Report Pipeline
+# ============================================================
+def analyze_one_pair(pair: Dict) -> Dict:
+    name = pair["name"]
+    out_dir = OUTPUT_ROOT / pair["sub_id"] / pair["date"] / pair["muscle"] / name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    bts, diy = read_bts_emt(pair["bts_emt"]), read_diy_csv(pair["diy_csv"])
+    t_common, fs = make_common_timebase(bts, diy)
+    
+    bts_raw_common = np.interp(t_common, bts["time"], bts["signal"])
+    diy_raw_common = np.interp(t_common, diy["time"], diy["signal"])
+
+    bts_pre = preprocess_emg(bts_raw_common, t_common, fs)
+    diy_pre = preprocess_emg(diy_raw_common, t_common, fs)
+
+    lag_samples, lag_sec, lag_corr = find_global_best_lag(minmax_normalize(bts_pre["rms"]), minmax_normalize(diy_pre["rms"]), fs)
+
+    t_aligned, bts_raw_al, diy_raw_al = align_by_lag(t_common, bts_raw_common, diy_raw_common, lag_samples)
+    _, bts_rms_al, diy_rms_al = align_by_lag(t_common, bts_pre["rms"], diy_pre["rms"], lag_samples)
+
+    bts_norm, diy_norm = minmax_normalize(bts_rms_al), minmax_normalize(diy_rms_al)
+    
+    bts_ev = detect_active_segment(t_aligned, bts_norm, fs)
+    diy_ev = detect_active_segment(t_aligned, diy_norm, fs)
+
+    common_onset = min(bts_ev["onset_idx"], diy_ev["onset_idx"])
+    common_offset = min(max(bts_ev["offset_idx"], diy_ev["offset_idx"]), len(t_aligned) - 1)
+
+    b_seg, d_seg = bts_norm[common_onset:common_offset], diy_norm[common_onset:common_offset]
+    trend_win = int(round(0.3 * fs))
+    b_trend, d_trend = moving_average(b_seg, trend_win), moving_average(d_seg, trend_win)
+    
+    p_corr = pearson_corr(b_seg, d_seg)
+    s_corr = spearman_corr(b_seg, d_seg)
+    t_corr = pearson_corr(b_trend, d_trend)
+    hla_score = high_low_agreement(b_seg, d_seg)
+    err_rmse = rmse(b_seg, d_seg)
+    dtw_val = dtw_distance(b_seg, d_seg)
+    similarity = max(0.0, t_corr) * 100.0 if np.isfinite(t_corr) else 0.0
+
+    rest_mask = t_aligned <= BASELINE_SEC
+    summary = {
+        "Name": name, "SubjectID": pair["sub_id"], "Date": pair["date"], "Muscle": pair["muscle"],
+        "Condition": pair["condition"], "Trial": pair["trial"], "DIY_Position": pair["diy_position"],
+        "SampleRate_Hz": fs, "Lag_Samples": lag_samples, "Lag_Sec": lag_sec, "Lag_CrossCorr": lag_corr,
+        "BTS_Baseline": bts_pre["baseline"], "DIY_Baseline": diy_pre["baseline"],
+        "BTS_Onset_Sec": bts_ev["onset_sec"], "DIY_Onset_Sec": diy_ev["onset_sec"], "Onset_Diff_Abs_Sec": abs(bts_ev["onset_sec"] - diy_ev["onset_sec"]),
+        "BTS_Peak_Sec": bts_ev["peak_sec"], "DIY_Peak_Sec": diy_ev["peak_sec"], "Peak_Diff_Abs_Sec": abs(bts_ev["peak_sec"] - diy_ev["peak_sec"]),
+        "BTS_Rest_RMS_Mean": float(np.mean(bts_rms_al[rest_mask])) if np.sum(rest_mask) else 0.0,
+        "DIY_Rest_RMS_Mean": float(np.mean(diy_rms_al[rest_mask])) if np.sum(rest_mask) else 0.0,
+        "BTS_Active_RMS_Mean": float(np.mean(bts_rms_al[common_onset:common_offset])),
+        "DIY_Active_RMS_Mean": float(np.mean(diy_rms_al[common_onset:common_offset])),
+        "Pearson_r": p_corr, "Spearman_r": s_corr, "Trend_r": t_corr, "High_Low_Agreement": hla_score,
+        "RMSE": err_rmse, "DTW_Distance": dtw_val, "Similarity_Score_Percent": similarity
+    }
+
+    pd.DataFrame({
+        "time_sec": t_aligned, "bts_raw": bts_raw_al, "diy_raw": diy_raw_al,
+        "bts_rms": bts_rms_al, "diy_rms": diy_rms_al, "bts_norm_rms": bts_norm, "diy_norm_rms": diy_norm
+    }).to_csv(out_dir / "processed_timeseries.csv", index=False, encoding="utf-8-sig")
+    
+    pd.DataFrame([summary]).to_csv(out_dir / "analysis_summary.csv", index=False, encoding="utf-8-sig")
+
+    fig, axes = plt.subplots(3, 1, figsize=(13, 10), dpi=PLOT_DPI)
+    axes[0].plot(t_aligned, minmax_normalize(np.abs(bts_raw_al)), label="BTS Raw (Abs Norm)", color="#1f77b4")
+    axes[0].plot(t_aligned, minmax_normalize(np.abs(diy_raw_al)), label="DIY Raw (Abs Norm)", color="#ff7f0e", alpha=0.75)
+    axes[0].set_title(f"1. Raw Waveform Comparison ({pair['placement']})")
+    axes[0].set_ylabel("Normalized Amp")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(loc="upper right")
+    
+    axes[1].plot(t_aligned, bts_rms_al, label="BTS RMS Envelope (mV)", color="#1f77b4", linewidth=1.5)
+    scale_factor = np.max(bts_rms_al) / np.max(diy_rms_al) if np.max(diy_rms_al) > 0 else 1.0
+    axes[1].plot(t_aligned, diy_rms_al * scale_factor, label="DIY RMS Envelope (Scaled ADC)", color="#ff7f0e", alpha=0.75, linewidth=1.5)
+    axes[1].axvline(bts_ev["onset_sec"], color="#1f77b4", linestyle="--", alpha=0.7, label="BTS Onset")
+    axes[1].axvline(diy_ev["onset_sec"], color="#ff7f0e", linestyle=":", alpha=0.7, label="DIY Onset")
+    axes[1].set_title("2. Smoothed RMS Envelope (Energy Trend)")
+    axes[1].set_ylabel("Voltage / Amplitude")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(loc="upper right")
+    
+    axes[2].plot(t_aligned, bts_norm, label="BTS Normalized RMS", color="#1f77b4", linewidth=1.8)
+    axes[2].plot(t_aligned, diy_norm, label="DIY Normalized RMS", color="#ff7f0e", alpha=0.8, linewidth=1.8)
+    axes[2].axvspan(t_aligned[common_onset], t_aligned[common_offset], color="#2ca02c", alpha=0.08, label="Analysis Active Zone")
+    axes[2].scatter([bts_ev["peak_sec"]], [bts_ev["peak_value"]], color="#1f77b4", s=40, zorder=5)
+    axes[2].scatter([diy_ev["peak_sec"]], [diy_ev["peak_value"]], color="#ff7f0e", s=40, zorder=5)
+    axes[2].set_title(f"3. Standardized %MVC Form (Trend r: {t_corr:.3f} | Similarity: {similarity:.1f}%)")
+    axes[2].set_xlabel("Time (seconds)")
+    axes[2].set_ylabel("Normalized Factor (0~1)")
+    axes[2].grid(True, alpha=0.3)
+    axes[2].legend(loc="upper right")
+    
+    plt.tight_layout()
+    plt.savefig(out_dir / "comparison_report.png")
+    plt.close()
+
+    print(f"  [Success] {name} | Lag = {lag_sec:.2f}s | Trend r = {t_corr:.3f} | Similarity = {similarity:.1f}%")
+    return summary
+
+
+# ============================================================
+# 🏁 Main Execution
+# ============================================================
+def main():
+    print("=============================================================")
+    print(" 🦾  Executing BTS FreeEMG vs DIY EMG Analysis Pipeline ")
+    print("=============================================================")
+    
+    pairs = auto_discover_and_pair_files()
+    if not pairs:
+        print("[Error] No matching DIY/BTS file pairs found in EMG_Data directory.")
+        return
+
+    summaries = []
+    for p in pairs:
+        try:
+            summary = analyze_one_pair(p)
+            summaries.append(summary)
+        except Exception as e:
+            print(f"[Error] Analysis failed for: {p.get('name', 'Unknown')} | Reason: {e}\n")
+
+    if summaries:
+        df_total = pd.DataFrame(summaries)
+        OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+        global_path = OUTPUT_ROOT / "global_analysis_summary.csv"
+        df_total.to_csv(global_path, index=False, encoding="utf-8-sig")
+        
+        print("\n=============================================================")
+        print("🎉 Analysis Pipeline Completed Successfully!")
+        print(f"📊 Global Analysis Summary saved to:\n    👉 {global_path}")
+        print("=============================================================\n")
+
+
+if __name__ == "__main__":
+    main()
